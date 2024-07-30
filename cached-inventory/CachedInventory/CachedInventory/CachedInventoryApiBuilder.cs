@@ -1,6 +1,8 @@
 namespace CachedInventory;
 
+using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Memory;
 
 public static class CachedInventoryApiBuilder
 {
@@ -27,21 +29,50 @@ public static class CachedInventoryApiBuilder
 
     app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, int productId) => await client.GetStock(productId))
+        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] IMemoryCache cache, int productId) =>
+        {
+          if (!cache.TryGetValue(productId, out var stock))
+          {
+            stock = await client.GetStock(productId);
+            _ = cache.Set(productId, stock, TimeSpan.FromMinutes(5));
+          }
+          return Results.Ok(stock);
+        })
       .WithName("GetStock")
       .WithOpenApi();
 
     app.MapPost(
         "/stock/retrieve",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req) =>
+        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] BulkRetrieveStockRequest req) =>
         {
-          var stock = await client.GetStock(req.ProductId);
-          if (stock < req.Amount)
+          var stockCache = new ConcurrentDictionary<int, int>();
+
+          var retrievalTasks = req.Items.Select(async item =>
           {
-            return Results.BadRequest("Not enough stock.");
+            if (!stockCache.TryGetValue(item.ProductId, out var stock))
+            {
+              stock = await client.GetStock(item.ProductId);
+              stockCache[item.ProductId] = stock;
+            }
+            if (stock < item.Amount)
+            {
+              return (item.ProductId, Success: false);
+            }
+            stockCache[item.ProductId] -= item.Amount;
+            return (item.ProductId, Success: true);
+          });
+
+          var results = await Task.WhenAll(retrievalTasks);
+          var failedItems = results.Where(result => !result.Success).Select(result => result.ProductId).ToList();
+
+          if (failedItems.Count != 0)
+          {
+            return Results.BadRequest($"Not enough stock for product(s): {string.Join(", ", failedItems)}");
           }
 
-          await client.UpdateStock(req.ProductId, stock - req.Amount);
+          var updateTasks = stockCache.Select(item => client.UpdateStock(item.Key, item.Value));
+          await Task.WhenAll(updateTasks);
+
           return Results.Ok();
         })
       .WithName("RetrieveStock")
@@ -50,10 +81,27 @@ public static class CachedInventoryApiBuilder
 
     app.MapPost(
         "/stock/restock",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
+        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] BulkRestockRequest req) =>
         {
-          var stock = await client.GetStock(req.ProductId);
-          await client.UpdateStock(req.ProductId, req.Amount + stock);
+          var stockCache = new ConcurrentDictionary<int, int>();
+
+          var restockTaks = req.Items.Select(async item =>
+          {
+            if (!stockCache.TryGetValue(item.ProductId, out var stock))
+            {
+              stock = await client.GetStock(item.ProductId);
+              stockCache[item.ProductId] = stock;
+            }
+
+            stockCache[item.ProductId] += item.Amount;
+            return item.ProductId;
+          });
+
+          await Task.WhenAll(restockTaks);
+
+          var updateTasks = stockCache.Select(item => client.UpdateStock(item.Key, item.Value));
+          await Task.WhenAll(updateTasks);
+
           return Results.Ok();
         })
       .WithName("Restock")
@@ -66,3 +114,7 @@ public static class CachedInventoryApiBuilder
 public record RetrieveStockRequest(int ProductId, int Amount);
 
 public record RestockRequest(int ProductId, int Amount);
+
+public record BulkRetrieveStockRequest(IEnumerable<RetrieveStockRequest> Items);
+
+public record BulkRestockRequest(IEnumerable<RestockRequest> Items);
